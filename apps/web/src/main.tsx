@@ -10,9 +10,12 @@ import {
 } from '@ui/analytics/bootstrap';
 import { shouldCaptureBootstrapAnalytics } from '@ui/analytics/bootstrapPolicy';
 import { AnalyticsRuntimeProvider } from '@ui/analytics/runtime';
+import { AgentPanel } from '@ui/components/AgentPanel';
 import { ErrorBoundary } from '@ui/components/ErrorBoundary';
 import { ThemeProvider } from '@ui/contexts/ThemeContext';
 import { captureSentryException } from '@ui/sentry';
+import { startAgentBridgeFromUrl } from '@ui/services/agentBridge';
+import { createStudioHost } from '@ui/services/agentBridgeHost';
 import { parseShareContext } from '@ui/services/shareRouting';
 import { initFormatter } from '@ui/utils/formatter';
 import { initializePlatform } from '@ui/platform';
@@ -23,6 +26,9 @@ const initialShareContext = parseShareContext(window.location.pathname, window.l
 if (initialShareContext) {
   window.__SHARE_CONTEXT = initialShareContext;
 }
+// Live link to a local agent server, only when opened with ?agentBridge=...&agentToken=...
+startAgentBridgeFromUrl(createStudioHost());
+
 window.__SHARE_API_BASE = import.meta.env.VITE_SHARE_API_URL || window.location.origin;
 window.__SHARE_ENABLED =
   import.meta.env.PROD || import.meta.env.VITE_ENABLE_PROD_SHARE_DEV === 'true';
@@ -70,6 +76,7 @@ if (window.__UNSUPPORTED_BROWSER) {
           <AnalyticsRuntimeProvider>
             <ErrorBoundary>
               <App />
+              <AgentPanel />
             </ErrorBoundary>
           </AnalyticsRuntimeProvider>
         </ThemeProvider>

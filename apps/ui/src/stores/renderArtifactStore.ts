@@ -201,6 +201,13 @@ export function getRenderArtifactState(): RenderArtifactStore {
   return renderArtifactStore.getState();
 }
 
+/** Calls `listener` on every store change; returns an unsubscribe function. */
+export function subscribeRenderArtifacts(
+  listener: (state: RenderArtifactStore, previous: RenderArtifactStore) => void
+): () => void {
+  return renderArtifactStore.subscribe(listener);
+}
+
 export function getLatestArtifactForTarget(renderTargetPath: string | null): RenderArtifact | null {
   if (!renderTargetPath) {
     return null;
