@@ -1,13 +1,27 @@
 /**
  * Agent bridge: a live two-way WebSocket link between this Studio tab and a local
- * agent server (an MCP server on this computer, wire protocol version 1).
+ * agent server (an MCP server on this computer, wire protocol version 2).
  *
- * Started only when the page is opened with `?agentBridge=<ws url>&agentToken=<token>`.
- * The URL must be a loopback `ws://` address; both parameters are removed from the
- * address bar as soon as they are read, and the token is never logged.
+ * Started only when the page is opened with `?agentBridge=<ws url>`. The URL must be a
+ * loopback `ws://` address and is removed from the address bar as soon as it is read.
+ * It is never logged and never rendered.
+ *
+ * The page holds no token. The agent server opened this page itself, through a one-time
+ * link that set an HttpOnly session cookie; the browser attaches that cookie to the
+ * WebSocket by itself (and always sends this page's Origin). Script cannot read the
+ * cookie. The cookie is scoped to an unguessable path, and that path is the first part
+ * of the URL's own path (`/__studio/<random>/agent`): a crafted link that points this
+ * page at another loopback port gets no cookie sent there, because the path is wrong. So
+ * the URL IS sensitive in that sense: keep it out of logs and the DOM. Version 1 sent an
+ * `agentToken` in the page URL; version 2 dropped it, and a server and a tab that
+ * disagree on the version refuse each other (status 'outdated'). The URL is kept in
+ * sessionStorage (this tab only) so a reload reconnects.
+ *
+ * The bridge also refuses to start inside a frame (`window.top !== window.self`): a page
+ * that framed this one could otherwise put the approval buttons under a click it chose.
  *
  * Frames (JSON text):
- *   tab -> server  { t:'hello', v:1, app }
+ *   tab -> server  { t:'hello', v:2, app }
  *   tab -> server  { t:'event', name:'state'|'source_changed'|'render_settled'|'approve', data }
  *   tab -> server  { t:'res', id, ok, result?, error? }
  *   server -> tab  { t:'req', id, tool, args }   tool is one of ALLOWED_TOOLS, nothing else
@@ -19,7 +33,7 @@
 import { createStore } from 'zustand/vanilla';
 import { useStore } from 'zustand';
 
-export const AGENT_BRIDGE_PROTOCOL_VERSION = 1;
+export const AGENT_BRIDGE_PROTOCOL_VERSION = 2;
 export const AGENT_BRIDGE_APP_NAME = 'openscad-studio-web';
 
 /** The only requests the tab will answer. Nothing here writes to disk or exports. */
@@ -83,6 +97,8 @@ export interface ScreenshotResult {
 export interface Approval {
   what: 'brief' | 'plan' | 'design' | 'gcode';
   revisionId?: string;
+  /** For `gcode`: the print request that was on screen. The server refuses it without. */
+  requestedAt?: string;
 }
 
 // ---- project_state, as pushed by the server (core.ts canvasState) -----------
@@ -155,7 +171,14 @@ export interface BridgeHost {
 
 // ---- panel store -------------------------------------------------------------
 
-export type BridgeStatus = 'off' | 'connecting' | 'open' | 'closed' | 'replaced';
+export type BridgeStatus =
+  | 'off'
+  | 'connecting'
+  | 'open'
+  | 'closed'
+  | 'replaced'
+  | 'refused'
+  | 'outdated';
 
 export interface AgentBridgeStoreState {
   status: BridgeStatus;
@@ -206,19 +229,16 @@ export function isLocalWsUrl(value: string): boolean {
 
 export interface BridgeParams {
   url: string;
-  token: string;
 }
 
-/** Reads the two page parameters; null unless both are present and the URL is local. */
+/** Reads the page parameter; null unless it is present and the URL is local. */
 export function parseBridgeParams(search: string): BridgeParams | null {
-  const params = new URLSearchParams(search);
-  const url = params.get('agentBridge');
-  const token = params.get('agentToken');
-  if (!url || !token || !isLocalWsUrl(url)) return null;
-  return { url, token };
+  const url = new URLSearchParams(search).get('agentBridge');
+  if (!url || !isLocalWsUrl(url)) return null;
+  return { url };
 }
 
-/** Removes the bridge parameters (and so the token) from the address bar. */
+/** Removes the bridge parameter (and the retired `agentToken`) from the address bar. */
 export function stripBridgeParams(win: Pick<Window, 'location' | 'history'>): void {
   const url = new URL(win.location.href);
   if (!url.searchParams.has('agentBridge') && !url.searchParams.has('agentToken')) return;
@@ -242,7 +262,6 @@ type SocketCtor = new (url: string) => SocketLike;
 
 export interface AgentBridgeOptions {
   url: string;
-  token: string;
   host: BridgeHost;
   WebSocketImpl?: SocketCtor;
   /** Quiet time after the last keystroke before `source_changed` is sent. */
@@ -254,6 +273,8 @@ export interface AgentBridgeOptions {
 const WS_OPEN = 1;
 /** The server closes with these when it will never accept this tab: do not retry. */
 const CLOSE_REPLACED = 4000;
+/** Another Studio tab is already connected: this one is refused, and must not retry in a loop. */
+const CLOSE_ALREADY_CONNECTED = 4002;
 const CLOSE_BAD_VERSION = 4001;
 
 function errorMessage(err: unknown): string {
@@ -297,6 +318,7 @@ export class AgentBridge {
       data: {
         what: approval.what,
         ...(approval.revisionId !== undefined ? { revisionId: approval.revisionId } : {}),
+        ...(approval.requestedAt !== undefined ? { requestedAt: approval.requestedAt } : {}),
       },
     });
   }
@@ -305,12 +327,10 @@ export class AgentBridge {
 
   private connect(): void {
     const Ctor = this.options.WebSocketImpl ?? (WebSocket as unknown as SocketCtor);
-    const target = new URL(this.options.url);
-    target.searchParams.set('token', this.options.token);
     agentBridgeStore.setState({ status: 'connecting' });
     let socket: SocketLike;
     try {
-      socket = new Ctor(target.toString());
+      socket = new Ctor(this.options.url);
     } catch {
       this.scheduleReconnect();
       return;
@@ -338,10 +358,19 @@ export class AgentBridge {
       this.socket = null;
       this.detach();
       if (this.stopped) return;
-      if (event.code === CLOSE_REPLACED || event.code === CLOSE_BAD_VERSION) {
+      if (
+        event.code === CLOSE_REPLACED ||
+        event.code === CLOSE_BAD_VERSION ||
+        event.code === CLOSE_ALREADY_CONNECTED
+      ) {
         this.stopped = true;
         agentBridgeStore.setState({
-          status: event.code === CLOSE_REPLACED ? 'replaced' : 'closed',
+          status:
+            event.code === CLOSE_REPLACED
+              ? 'replaced'
+              : event.code === CLOSE_ALREADY_CONNECTED
+                ? 'refused'
+                : 'outdated',
         });
         return;
       }
@@ -535,26 +564,67 @@ function isProjectState(value: unknown): value is ProjectState {
 
 // ---- entry point -------------------------------------------------------------
 
+const STORED_URL_KEY = 'agentBridgeUrl';
+
+/** sessionStorage can throw (private mode, blocked data); the bridge works without it. */
+function readStoredUrl(): string | null {
+  try {
+    const value = window.sessionStorage.getItem(STORED_URL_KEY);
+    return value !== null && isLocalWsUrl(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredUrl(url: string | null): void {
+  try {
+    if (url === null) window.sessionStorage.removeItem(STORED_URL_KEY);
+    else window.sessionStorage.setItem(STORED_URL_KEY, url);
+  } catch {
+    // ignore
+  }
+}
+
+/** True when this page is inside another page's frame. Cross-origin `top` still compares fine. */
+export function isFramed(win: Partial<Pick<Window, 'top' | 'self'>>): boolean {
+  try {
+    return win.top !== win.self;
+  } catch {
+    return true;
+  }
+}
+
 /**
- * Reads the page URL once. If it carries a valid local bridge link, starts the bridge;
- * in every case the bridge parameters are removed from the address bar. Returns the
- * running bridge, or null when there is nothing to start.
+ * Reads the page URL once. If it carries a valid local bridge URL (or, after a reload,
+ * the one remembered for this tab in sessionStorage; it is not a secret), starts the
+ * bridge. In every case the bridge parameter is removed from the address bar. Returns
+ * the running bridge, or null when there is nothing to start.
  */
 export function startAgentBridgeFromUrl(
   host: BridgeHost,
-  win: Pick<Window, 'location' | 'history'> = window,
+  win: Pick<Window, 'location' | 'history'> & Partial<Pick<Window, 'top' | 'self'>> = window,
   overrides: Partial<AgentBridgeOptions> = {}
 ): AgentBridge | null {
-  const params = parseBridgeParams(win.location.search);
+  // Framed: never start (so the panel, which only shows once the bridge is running, never
+  // appears), and do not keep the link URL. Strip it from the address bar all the same.
+  if (isFramed(win)) {
+    stripBridgeParams(win);
+    writeStoredUrl(null);
+    return null;
+  }
+  const fromPage = parseBridgeParams(win.location.search);
   stripBridgeParams(win);
-  if (!params || activeBridge) return null;
-  const bridge = new AgentBridge({ ...params, host, ...overrides });
+  const url = fromPage?.url ?? readStoredUrl();
+  if (url === null || activeBridge) return null;
+  writeStoredUrl(url);
+  const bridge = new AgentBridge({ url, host, ...overrides });
   activeBridge = bridge;
   bridge.start();
   return bridge;
 }
 
 export function __resetAgentBridgeForTests() {
+  writeStoredUrl(null);
   activeBridge?.stop();
   activeBridge = null;
   agentBridgeStore.setState({ status: 'off', projectState: null, notice: null });

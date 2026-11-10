@@ -85,11 +85,20 @@ const REQUEST = {
   requestedAt: '2026-11-10T10:00:00.000Z',
 };
 
-function show(projectState: ProjectState | null, status: 'open' | 'connecting' = 'open') {
+function show(
+  projectState: ProjectState | null,
+  status: 'open' | 'connecting' | 'refused' = 'open'
+) {
   act(() => getAgentBridgeStore().setState({ status, projectState, notice: null }));
 }
 
 describe('AgentPanel', () => {
+  it('says plainly when another Studio tab is already connected', () => {
+    render(<AgentPanel />);
+    show(null, 'refused');
+    expect(screen.getByText(/Another Studio tab is already connected/)).toBeInTheDocument();
+  });
+
   beforeEach(() => {
     act(() => __resetAgentBridgeForTests());
   });
@@ -102,7 +111,7 @@ describe('AgentPanel', () => {
     window.history.replaceState(
       null,
       '',
-      '/?agentBridge=ws%3A%2F%2F127.0.0.1%3A4321%2Fagent%3Fproject%3Dp1&agentToken=t'
+      '/?agentBridge=ws%3A%2F%2F127.0.0.1%3A4321%2Fagent%3Fproject%3Dp1'
     );
     startAgentBridgeFromUrl(host, window, { WebSocketImpl: FakeSocket });
     FakeSocket.current.onopen?.({});
@@ -194,7 +203,9 @@ describe('AgentPanel', () => {
       fireEvent.click(screen.getByLabelText('The printer bed is clear and I am ready'));
       expect(button).toBeEnabled();
       fireEvent.click(button);
-      expect(approvals()).toEqual([{ what: 'gcode', revisionId: 'rev-1' }]);
+      expect(approvals()).toEqual([
+        { what: 'gcode', revisionId: 'rev-1', requestedAt: REQUEST.requestedAt },
+      ]);
 
       // Locked after one press, however often it is clicked.
       expect(screen.getByRole('button', { name: 'Sent' })).toBeDisabled();

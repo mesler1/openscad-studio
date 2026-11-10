@@ -41,7 +41,11 @@ export function PrintConfirmation({ request }: { request: PrintRequestInfo }) {
   const press = () => {
     if (!ready || sent) return;
     setSent(true);
-    sendAgentApproval({ what: 'gcode', revisionId: request.revisionId });
+    sendAgentApproval({
+      what: 'gcode',
+      revisionId: request.revisionId,
+      requestedAt: request.requestedAt,
+    });
   };
   return (
     <section
@@ -168,11 +172,15 @@ export function AgentPanel() {
   const connection =
     status === 'open'
       ? null
-      : status === 'replaced'
-        ? 'Another Studio tab took over this link.'
-        : status === 'connecting'
-          ? 'Connecting to the agent...'
-          : 'Disconnected. Retrying...';
+      : status === 'outdated'
+        ? 'The agent server and this Studio build use different versions of the link. Update both.'
+        : status === 'refused'
+          ? 'Another Studio tab is already connected. Close it, or use that tab.'
+          : status === 'replaced'
+            ? 'Another Studio tab took over this link.'
+            : status === 'connecting'
+              ? 'Connecting to the agent...'
+              : 'Disconnected. Retrying...';
 
   return (
     <aside

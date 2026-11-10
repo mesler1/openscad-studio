@@ -26,7 +26,7 @@ const initialShareContext = parseShareContext(window.location.pathname, window.l
 if (initialShareContext) {
   window.__SHARE_CONTEXT = initialShareContext;
 }
-// Live link to a local agent server, only when opened with ?agentBridge=...&agentToken=...
+// Live link to a local agent server, only when opened with ?agentBridge=<loopback ws url>
 startAgentBridgeFromUrl(createStudioHost());
 
 window.__SHARE_API_BASE = import.meta.env.VITE_SHARE_API_URL || window.location.origin;

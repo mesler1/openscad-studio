@@ -116,7 +116,6 @@ function start(overrides: Record<string, unknown> = {}) {
   const fake = makeHost();
   const bridge = new AgentBridge({
     url: 'ws://127.0.0.1:4321/agent?project=p1',
-    token: 'secret-token',
     host: fake.host,
     WebSocketImpl: FakeSocket,
     sourceDebounceMs: 100,
@@ -166,15 +165,18 @@ describe('URL gating', () => {
     }
   });
 
-  it('needs both parameters', () => {
-    expect(parseBridgeParams('?agentBridge=ws://127.0.0.1:1/agent')).toBeNull();
+  it('needs the agentBridge parameter, and ignores the retired agentToken', () => {
+    expect(parseBridgeParams('')).toBeNull();
     expect(parseBridgeParams('?agentToken=t')).toBeNull();
+    expect(parseBridgeParams('?agentBridge=ws%3A%2F%2F127.0.0.1%3A1%2Fagent')).toEqual({
+      url: 'ws://127.0.0.1:1/agent',
+    });
     expect(parseBridgeParams('?agentBridge=ws%3A%2F%2F127.0.0.1%3A1%2Fagent&agentToken=t')).toEqual(
-      { url: 'ws://127.0.0.1:1/agent', token: 't' }
+      { url: 'ws://127.0.0.1:1/agent' }
     );
   });
 
-  it('refuses a non-local URL: no socket is opened, yet the token is still removed', () => {
+  it('refuses a non-local URL: no socket is opened, yet the parameters are still removed', () => {
     window.history.replaceState(
       null,
       '',
@@ -189,24 +191,95 @@ describe('URL gating', () => {
     expect(window.location.hash).toBe('#h');
   });
 
-  it('starts for a local URL, connects with the token, and strips both parameters', () => {
+  it('starts for a local URL, connects to exactly that URL with no token, and strips the parameter', () => {
     window.history.replaceState(
       null,
       '',
-      '/?agentBridge=ws%3A%2F%2F127.0.0.1%3A4321%2Fagent%3Fproject%3Dp1&agentToken=tok123'
+      '/?agentBridge=ws%3A%2F%2F127.0.0.1%3A4321%2F__studio%2Fagent%3Fproject%3Dp1'
     );
     const bridge = startAgentBridgeFromUrl(makeHost().host, window, {
       WebSocketImpl: FakeSocket,
     });
     expect(bridge).not.toBeNull();
     expect(window.location.search).toBe('');
-    expect(window.location.href).not.toContain('tok123');
     expect(window.location.href).not.toContain('agentBridge');
     const socket = FakeSocket.instances[0];
-    const url = new URL(socket.url);
-    expect(url.origin).toBe('ws://127.0.0.1:4321');
-    expect(url.searchParams.get('project')).toBe('p1');
-    expect(url.searchParams.get('token')).toBe('tok123');
+    expect(socket.url).toBe('ws://127.0.0.1:4321/__studio/agent?project=p1');
+    expect(socket.url).not.toMatch(/token/i);
+  });
+
+  it('remembers the URL for this tab so a reload reconnects, and forgets a non-local one', () => {
+    window.history.replaceState(
+      null,
+      '',
+      '/?agentBridge=ws%3A%2F%2F127.0.0.1%3A4321%2F__studio%2Fagent%3Fproject%3Dp1'
+    );
+    startAgentBridgeFromUrl(makeHost().host, window, { WebSocketImpl: FakeSocket });
+    expect(window.location.search).toBe('');
+    // A reload: the page parameter is gone and the module state is fresh.
+    FakeSocket.instances = [];
+    const stored = window.sessionStorage.getItem('agentBridgeUrl');
+    __resetAgentBridgeForTests(); // clears storage as part of a test reset
+    window.sessionStorage.setItem('agentBridgeUrl', stored!);
+    window.history.replaceState(null, '', '/');
+    expect(
+      startAgentBridgeFromUrl(makeHost().host, window, { WebSocketImpl: FakeSocket })
+    ).not.toBeNull();
+    expect(FakeSocket.instances[0].url).toBe('ws://127.0.0.1:4321/__studio/agent?project=p1');
+
+    __resetAgentBridgeForTests();
+    FakeSocket.instances = [];
+    window.sessionStorage.setItem('agentBridgeUrl', 'ws://evil.example:1/agent');
+    expect(
+      startAgentBridgeFromUrl(makeHost().host, window, { WebSocketImpl: FakeSocket })
+    ).toBeNull();
+    expect(FakeSocket.instances).toHaveLength(0);
+  });
+
+  it('uses the secret path segment from the URL as given, and removes it from the address bar', () => {
+    const seg = 'ab'.repeat(24);
+    const ws = `ws://127.0.0.1:4321/__studio/${seg}/agent?project=p1`;
+    window.history.replaceState(null, '', `/?agentBridge=${encodeURIComponent(ws)}`);
+    const bridge = startAgentBridgeFromUrl(makeHost().host, window, {
+      WebSocketImpl: FakeSocket,
+    });
+    expect(bridge).not.toBeNull();
+    expect(FakeSocket.instances[0].url).toBe(ws);
+    expect(window.location.href).not.toContain(seg);
+    expect(window.location.search).toBe('');
+    // Never rendered: nothing in the document holds it.
+    expect(document.documentElement.outerHTML).not.toContain(seg);
+  });
+
+  it('refuses to start inside a frame: no socket, no panel, nothing remembered, URL still stripped', () => {
+    const ws = 'ws://127.0.0.1:4321/__studio/' + 'cd'.repeat(24) + '/agent?project=p1';
+    window.history.replaceState(null, '', `/?agentBridge=${encodeURIComponent(ws)}`);
+    const framed = {
+      location: window.location,
+      history: window.history,
+      top: {} as Window, // a different window than `self`: we are in a frame
+      self: window,
+    };
+    const bridge = startAgentBridgeFromUrl(makeHost().host, framed, {
+      WebSocketImpl: FakeSocket,
+    });
+    expect(bridge).toBeNull();
+    expect(FakeSocket.instances).toHaveLength(0);
+    expect(getAgentBridgeStore().getState().status).toBe('off'); // the panel renders nothing when off
+    expect(window.sessionStorage.getItem('agentBridgeUrl')).toBeNull();
+    expect(window.location.search).toBe('');
+    // A stored link from before is not used inside a frame either.
+    window.sessionStorage.setItem('agentBridgeUrl', ws);
+    expect(
+      startAgentBridgeFromUrl(makeHost().host, framed, { WebSocketImpl: FakeSocket })
+    ).toBeNull();
+    expect(FakeSocket.instances).toHaveLength(0);
+    expect(window.sessionStorage.getItem('agentBridgeUrl')).toBeNull();
+    // The same page not in a frame starts normally.
+    window.history.replaceState(null, '', `/?agentBridge=${encodeURIComponent(ws)}`);
+    expect(
+      startAgentBridgeFromUrl(makeHost().host, window, { WebSocketImpl: FakeSocket })
+    ).not.toBeNull();
   });
 
   it('does nothing without the parameters', () => {
@@ -215,7 +288,7 @@ describe('URL gating', () => {
     expect(getAgentBridgeStore().getState().status).toBe('off');
   });
 
-  it('never logs the token', () => {
+  it('never logs the bridge URL', () => {
     const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((m) =>
       jest.spyOn(console, m).mockImplementation(() => undefined)
     );
@@ -223,7 +296,7 @@ describe('URL gating', () => {
     socket.drop();
     jest.advanceTimersByTime(1000);
     for (const spy of spies) {
-      expect(JSON.stringify(spy.mock.calls)).not.toContain('secret-token');
+      expect(JSON.stringify(spy.mock.calls)).not.toContain('127.0.0.1');
       spy.mockRestore();
     }
   });
@@ -240,11 +313,19 @@ describe('connection', () => {
     jest.useRealTimers();
   });
 
-  it('says hello on open (protocol 1), then reports its state', () => {
+  it('says hello on open (protocol 2), then reports its state', () => {
     const { socket } = start();
-    expect(socket.sent[0]).toEqual({ t: 'hello', v: 1, app: 'openscad-studio-web' });
+    expect(socket.sent[0]).toEqual({ t: 'hello', v: 2, app: 'openscad-studio-web' });
     const state = socket.frames('event', 'state')[0];
     expect(state.data).toMatchObject({ path: 'main.scad', source: 'cube(1);', dirty: false });
+  });
+
+  it('stops with a clear status when the server refuses the protocol version (old server or old tab)', () => {
+    const { socket } = start();
+    socket.drop(4001);
+    expect(getAgentBridgeStore().getState().status).toBe('outdated');
+    jest.advanceTimersByTime(60_000);
+    expect(FakeSocket.instances).toHaveLength(1);
   });
 
   it('reconnects with growing backoff, and stops when replaced by a newer tab', () => {
@@ -264,6 +345,22 @@ describe('connection', () => {
     jest.advanceTimersByTime(60_000);
     expect(FakeSocket.instances).toHaveLength(3);
     expect(getAgentBridgeStore().getState().status).toBe('replaced');
+  });
+});
+
+describe('refused because another tab is connected', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+    FakeSocket.instances = [];
+    __resetAgentBridgeForTests();
+  });
+
+  it('shows a refused status and never retries', () => {
+    const { socket } = start();
+    socket.drop(4002);
+    jest.advanceTimersByTime(120_000);
+    expect(FakeSocket.instances).toHaveLength(1);
+    expect(getAgentBridgeStore().getState().status).toBe('refused');
   });
 });
 
@@ -514,10 +611,10 @@ describe('what the server pushes', () => {
     const { socket, bridge } = start();
     expect(sendAgentApproval({ what: 'plan' })).toBe(false); // not the registered bridge
     expect(bridge.sendApproval({ what: 'design' })).toBe(true);
-    expect(bridge.sendApproval({ what: 'gcode', revisionId: 'r1' })).toBe(true);
+    expect(bridge.sendApproval({ what: 'gcode', revisionId: 'r1', requestedAt: 'T1' })).toBe(true);
     expect(socket.frames('event', 'approve').map((f) => f.data)).toEqual([
       { what: 'design' },
-      { what: 'gcode', revisionId: 'r1' },
+      { what: 'gcode', revisionId: 'r1', requestedAt: 'T1' },
     ]);
     socket.drop();
     expect(bridge.sendApproval({ what: 'brief' })).toBe(false);
